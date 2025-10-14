@@ -21,10 +21,11 @@
     <div class="video-container" v-if="videoSrc">
       <video 
         ref="video"
-        :src="videoSrc"
+        :key="videoSrc"
         class="video-player"
         controls
         preload="auto"
+        muted="true"
         @loadedmetadata="onVideoLoaded"
         @error="onVideoError"
         @play="onPlay"
@@ -55,9 +56,10 @@
 <script setup lang="ts">
 import type { Folder, Item } from '@/components/FolderTypes';
 import SearchableSelect from '@/components/SearchableSelect.vue';
-import { ref, computed, onMounted, onUnmounted } from 'vue';
+import { ref, computed, onMounted, onUnmounted, watch } from 'vue';
 import { useRoute } from 'vue-router';
 import VideoUploader from './VideoUploader.vue';
+import Hls from 'hls.js';
 
 
 const route = useRoute();
@@ -73,36 +75,56 @@ const video = ref<HTMLVideoElement | null>(null);
 const currentTime = ref(0);
 const duration = ref(0);
 const showModal = ref<boolean>(false)
+
+// Экземпляр Hls
+let hls: Hls | null = null;
+
 // WebSocket
 let ws: WebSocket | null = null;
 let timeOut : boolean = false;
 const timeOutTime: number = 30;
-// Вычисляемый путь к видео
+
+// *** videoSrc остается таким же ***
 const videoSrc = computed<string>(() => {
   const selected = videoURL.value;
   if (!selected || !selected.key?.trim()) return '';
 
-  const safeName = encodeURIComponent(selected.key.trim());
+  const safeFileName = encodeURIComponent(selected.key.trim());
+  const lowerCaseFileName = selected.key.trim().toLowerCase();
 
-  return `http://${import.meta.env.VITE_BASE_URL_VIDEO_SERVICE}/video?file_name=${safeName}`;
+  // Если файл .mp4, предполагаем, что для него есть HLS-версия
+  if (lowerCaseFileName.endsWith('.mp4')) {
+    const folderName = safeFileName.replace(/\.mp4$/i, ''); // Имя папки без расширения
+    // Теперь этот URL будет соответствовать новому роуту /hls/ на Go-сервере
+    return `http://${import.meta.env.VITE_BASE_URL_VIDEO_SERVICE}/hls/${folderName}/main.m3u8`;
+  } else {
+    // Для других типов файлов или если HLS не применим
+    return `http://${import.meta.env.VITE_BASE_URL_VIDEO_SERVICE}/video?file_name=${safeFileName}`;
+  }
 });
 
-// Добавление в лог
+// *** isCurrentVideoHls также остается таким же ***
+const isCurrentVideoHls = computed<boolean>(() => {
+  return videoURL.value?.key?.toLowerCase().endsWith('.mp4') ?? false;
+});
+
+
 const addLog = (text: string) => {
   console.log(`[LOG] ${text}`);
   log.value.unshift({ message: text, timestamp: Date.now() });
   if (log.value.length > 50) log.value.pop();
 };
 
-// Формат времени (мм:сс)
 const formatTime = (time: number): string => {
   const seconds = Math.floor(time % 60);
   const minutes = Math.floor(time / 60);
   return `${minutes}:${seconds < 10 ? '0' : ''}${seconds}`;
 };
+
 const onAddVideo = () => {
   showModal.value =true;
 }
+
 const onVideoSelected = async (event:any) => {
   sendMessage('change-video', video.value?.currentTime, event.key)
   addLog(event);
@@ -111,8 +133,8 @@ const onVideoSelected = async (event:any) => {
       const data = response.body;
       addLog(`Видео для комнаты успешно изменено ${data}`)
     }
-
 }
+
 const onDeleteVideo = async (event:Item | null) => {
   if(event == null) return;
 
@@ -123,7 +145,7 @@ const onDeleteVideo = async (event:Item | null) => {
     videoList.value = videoList.value.filter(item => item.Items != event)
   }
 }
-// Подключение к WebSocket
+
 const connect = () => {
   const roomCode = route.params.roomCode as string;
   if (!roomCode) {
@@ -158,13 +180,14 @@ const connect = () => {
     console.error(err);
   };
 };
+
 const setInputTimeOut = ():boolean => {
   if(timeOut) return timeOut;
   timeOut = true;
   setTimeout(()=> timeOut = false, timeOutTime)
   return false;
 }
-// Обработка входящих сообщений
+
 const handleWSMessage = (message: any): void => {
   if (!video.value) return;
   if (setInputTimeOut()) return;
@@ -202,7 +225,6 @@ const handleWSMessage = (message: any): void => {
   }
 };
 
-// Отправка сообщения
 const sendMessage = (type: 'play' | 'pause' | 'seek' | 'change-video', time?: number, payload?:string) => {
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
   addLog("send " +type)
@@ -219,11 +241,121 @@ const sendMessage = (type: 'play' | 'pause' | 'seek' | 'change-video', time?: nu
   ws.send(JSON.stringify(msg));
 };
 
-// Обработчики видео
+const isHlsInitializing = ref(false);
+
+const cleanupHls = () => {
+  if (hls) {
+    hls.destroy();
+    hls = null;
+    addLog('🧹 HLS очищен');
+  }
+};
+
+const cleanupVideo = () => {
+  if (video.value) {
+    video.value.pause();
+    video.value.src = '';
+    video.value.removeAttribute('src');
+    video.value.load();
+    addLog('🧹 Видео очищено');
+  }
+};
+
+const initHls = async () => {
+  // Защита от повторной инициализации
+  if (isHlsInitializing.value) {
+    addLog('⚠️ HLS уже инициализируется, пропускаем');
+    return;
+  }
+
+  addLog(`initHls вызвана. videoURL: ${videoURL.value?.key}, videoSrc: ${videoSrc.value}`);
+  
+  if (!video.value || !videoURL.value) {
+    addLog('⚠️ Отсутствует видеоэлемент или URL видео');
+    return;
+  }
+
+  isHlsInitializing.value = true;
+  
+  try {
+    // Очищаем предыдущие ресурсы
+    cleanupHls();
+    cleanupVideo();
+
+    // Даем время на очистку DOM
+    await new Promise(resolve => setTimeout(resolve, 100));
+
+    if (Hls.isSupported() && isCurrentVideoHls.value) {
+      addLog(`✨ Инициализация HLS для: ${videoSrc.value}`);
+      
+      hls = new Hls({
+        enableWorker: true,
+        lowLatencyMode: true,
+        backBufferLength: 90
+      });
+
+      hls.loadSource(videoSrc.value);
+      hls.attachMedia(video.value);
+
+      hls.on(Hls.Events.MEDIA_ATTACHED, () => {
+        addLog('✅ HLS: Медиаэлемент прикреплен');
+      });
+
+      hls.on(Hls.Events.MANIFEST_PARSED, (event, data) => {
+        addLog(`🚀 HLS манифест загружен, ${data.levels.length} качеств`);
+        duration.value = video.value?.duration || 0;
+        
+        // Автовоспроизведение после загрузки
+        video.value?.play().catch(e => {
+          addLog(`🔇 Автовоспроизведение отклонено: ${e.message}`);
+        });
+      });
+
+      hls.on(Hls.Events.ERROR, (event, data) => {
+        addLog(`❌ HLS ошибка: ${data.type} - ${data.details}`);
+        console.error('HLS Error:', data);
+        
+        if (data.fatal) {
+          switch (data.type) {
+            case Hls.ErrorTypes.NETWORK_ERROR:
+              addLog("🔄 Восстановление после сетевой ошибки...");
+              hls?.startLoad();
+              break;
+            case Hls.ErrorTypes.MEDIA_ERROR:
+              addLog("🔄 Восстановление после медиа ошибки...");
+              hls?.recoverMediaError();
+              break;
+            default:
+              addLog("💀 Фатальная ошибка HLS, пересоздание...");
+              cleanupHls();
+              break;
+          }
+        }
+      });
+
+    } 
+    // else if (videoSrc.value) {
+    //   // Для не-HLS видео
+    //   addLog(`📹 Загрузка обычного видео: ${videoSrc.value}`);
+    //   video.value.src = videoSrc.value;
+    //   video.value.load();
+    // }
+
+  } catch (error) {
+    addLog(`💥 Ошибка инициализации HLS: ${error}`);
+    console.error('HLS Init Error:', error);
+  } finally {
+    isHlsInitializing.value = false;
+  }
+};
+
 const onVideoLoaded = (event: Event): void => {
   const vid = event.target as HTMLVideoElement;
   duration.value = vid.duration;
   addLog(`📹 Видео загружено (${formatTime(vid.duration)})`);
+  if (!hls && video.value?.src) {
+    duration.value = video.value.duration;
+  }
 };
 
 const onVideoError = (event: Event): void => {
@@ -243,12 +375,9 @@ const onTimeUpdate = () => {
   currentTime.value = video.value?.currentTime || 0;
 };
 
-
-// Жизненный цикл
 onMounted(async () => {
   isLoading.value = true;
 
-  // Подключение к комнате
   connect();
   try {
     const response = await fetch(`/api/room?key=${route.params.roomCode}`);
@@ -266,7 +395,6 @@ onMounted(async () => {
     console.error(error);
   }
 
-  // Загрузка списка видео
   try {
     const response = await fetch(`/api/video/all`);
     if (response.ok) {
@@ -288,13 +416,28 @@ onMounted(async () => {
   } finally {
     isLoading.value = false;
   }
+
+  if (videoURL.value) {
+    console.log("asdasd", videoURL.value)
+    initHls();
+  }
 });
 
+watch(videoURL, async (newValue, oldValue) => {
+  if (newValue && newValue.key !== oldValue?.key) {
+    addLog(`🔄 Переключение видео с ${oldValue?.key} на ${newValue.key}`);
+    
+    // Небольшая задержка для гарантии обновления computed свойств
+    await initHls();
+  }
+}, { immediate: false });
 
 onUnmounted(() => {
   if (ws) {
     ws.close();
   }
+  cleanupHls();
+  cleanupVideo();
 });
 </script>
 
