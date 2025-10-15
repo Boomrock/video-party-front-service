@@ -273,12 +273,11 @@ const initHls = async () => {
     // Даем время на очистку DOM
     await new Promise(resolve => setTimeout(resolve, 100));
 
-    if (Hls.isSupported()) {
+    if (Hls.isSupported() && !video.value) {
       addLog(`✨ Инициализация HLS для: ${videoSrc.value}`);
       
       hls = new Hls({
         enableWorker: true,
-
       });
 
       hls.loadSource(videoSrc.value);
