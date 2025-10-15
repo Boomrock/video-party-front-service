@@ -9,12 +9,12 @@ export default defineConfig({
   server: {
     proxy: {
       '/api/room': {
-        target: 'http://127.0.0.1:3000', // ✅ Добавлен http://
+        target: 'http://188.134.88.204:3000',
         changeOrigin: true,
         rewrite: (path) => path.replace(/^\/api/, ''),
       },
       '/api/video': {
-        target: 'http://127.0.0.1:3030', // ✅ Аналогично
+        target: 'http://188.134.88.204:3030', 
         changeOrigin: true,
         rewrite: (path) => path.replace(/^\/api/, ''),
       }

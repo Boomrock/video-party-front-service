@@ -90,23 +90,10 @@ const videoSrc = computed<string>(() => {
   if (!selected || !selected.key?.trim()) return '';
 
   const safeFileName = encodeURIComponent(selected.key.trim());
-  const lowerCaseFileName = selected.key.trim().toLowerCase();
-
-  // Если файл .mp4, предполагаем, что для него есть HLS-версия
-  if (lowerCaseFileName.endsWith('.mp4')) {
-    const folderName = safeFileName.replace(/\.mp4$/i, ''); // Имя папки без расширения
-    // Теперь этот URL будет соответствовать новому роуту /hls/ на Go-сервере
-    return `http://${import.meta.env.VITE_BASE_URL_VIDEO_SERVICE}/hls/${folderName}/main.m3u8`;
-  } else {
-    // Для других типов файлов или если HLS не применим
-    return `http://${import.meta.env.VITE_BASE_URL_VIDEO_SERVICE}/video?file_name=${safeFileName}`;
-  }
+  return `/api/video/hls/${safeFileName}/480p.m3u8`;
 });
 
-// *** isCurrentVideoHls также остается таким же ***
-const isCurrentVideoHls = computed<boolean>(() => {
-  return videoURL.value?.key?.toLowerCase().endsWith('.mp4') ?? false;
-});
+
 
 
 const addLog = (text: string) => {
@@ -270,8 +257,9 @@ const initHls = async () => {
 
   addLog(`initHls вызвана. videoURL: ${videoURL.value?.key}, videoSrc: ${videoSrc.value}`);
   
-  if (!video.value || !videoURL.value) {
-    addLog('⚠️ Отсутствует видеоэлемент или URL видео');
+
+  if (!videoURL.value ) {
+    addLog('⚠️ Отсутствует URL видео');
     return;
   }
 
@@ -285,13 +273,12 @@ const initHls = async () => {
     // Даем время на очистку DOM
     await new Promise(resolve => setTimeout(resolve, 100));
 
-    if (Hls.isSupported() && isCurrentVideoHls.value) {
+    if (Hls.isSupported()) {
       addLog(`✨ Инициализация HLS для: ${videoSrc.value}`);
       
       hls = new Hls({
         enableWorker: true,
-        lowLatencyMode: true,
-        backBufferLength: 90
+
       });
 
       hls.loadSource(videoSrc.value);
@@ -301,7 +288,7 @@ const initHls = async () => {
         addLog('✅ HLS: Медиаэлемент прикреплен');
       });
 
-      hls.on(Hls.Events.MANIFEST_PARSED, (event, data) => {
+      hls.on(Hls.Events.MANIFEST_PARSED, (event: any, data: any) => {
         addLog(`🚀 HLS манифест загружен, ${data.levels.length} качеств`);
         duration.value = video.value?.duration || 0;
         
@@ -311,7 +298,7 @@ const initHls = async () => {
         });
       });
 
-      hls.on(Hls.Events.ERROR, (event, data) => {
+      hls.on(Hls.Events.ERROR, (event: any, data: any) => {
         addLog(`❌ HLS ошибка: ${data.type} - ${data.details}`);
         console.error('HLS Error:', data);
         
